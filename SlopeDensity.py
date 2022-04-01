@@ -1,118 +1,195 @@
 
+import json
 import cv2
 import time
+import argparse
 import numpy as np
 import requests as req
+import mysql.connector
 from PIL import Image
 from io import BytesIO
 
-# Custom
-from CollisionBox import CollisionBox
 
 # CV2 requires image data as np array
-def URLtoNumpy(url):
-    img = Image.open(BytesIO(req.get(url).content))
+def URLtoNumpy(URL):
+    img = Image.open(BytesIO(req.get(URL).content))
     return np.array(img)
 
-def CalculateSlopeDensity():
 
-    # Image dims = 1280x960
+# Return normal and pre-processed a frame
+def ProcessNewFrame(URL):
 
-    # Set the initial image
-    #init_frame = cv2.imread("./images/empty_slope.jpg")
-    #gray_frame = cv2.cvtColor(init_frame, cv2.COLOR_BGR2GRAY)
-    #init_frame = cv2.GaussianBlur(gray_frame, (25, 25), 3)
+    # Get current frame as 1280x960 np array 
+    orig_frame = URLtoNumpy(URL)
 
-    # Store previous frame for comparison of frames
-    prev_frame = None
-    # Record detections
+    # Gray conversion and noise reduction (smoothening)
+    gray_frame = cv2.cvtColor(orig_frame, cv2.COLOR_BGR2GRAY)
+    blur_frame = cv2.GaussianBlur(gray_frame, (25, 25), 3)
+
+    return orig_frame, blur_frame
+    
+
+# Return array contours around differences the previous and current frames
+def DetectMotion(prev_frame, curr_frame):
+
+    # Return empty if frames are the same
+    if np.array_equiv(prev_frame, curr_frame) or \
+       np.array_equal(prev_frame, curr_frame):
+        return np.empty(0)
+
+    # Difference between the comparison frame and the previous
+    delta_frame = cv2.subtract(prev_frame, curr_frame)
+    # Convert delta_frame into a binary image using a threshold of 15
+    binary_frame = cv2.threshold(delta_frame, 15, 255, cv2.THRESH_BINARY)[1]
+    # Initialise a list of contours within the current frame
+    (contours,_) = cv2.findContours(binary_frame, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
+
+    return contours
+
+
+# Return array of contours that have collided with detection boxes
+def ContourDetections(cont_arr, dbox_arr):
+    cont_coll = []
+    # Process detected contours
+    for cont in cont_arr:
+        # Get contour moments
+        M = cv2.moments(cont)
+        # Calculate centroid
+        cx = int(M['m10']/M['m00'])
+        cy = int(M['m01']/M['m00'])
+
+        # Compare with all collision boxes
+        for dbox in dbox_arr:
+            if (cv2.pointPolygonTest(dbox, (cx, cy), False) == 1):
+                cont_coll.append(cont)
+
+    return np.array(cont_coll)
+
+
+def main(prod=False):
+
+    # Process a frame to use for the first comparison
+    disp_frame, prev_frame = ProcessNewFrame("https://webcam.thesnowcentre.com/record/current.jpg")
+    
+    # Contours for detecting movement in specific areas
+    dect_conts = np.array([
+                          [(0, 450), (900, 450), (900, 500), (0, 500)]
+                         ])
+    
     detections = 0
-    # Collision box
-    cbox = CollisionBox(0, 450, 900, 50)
-    # Flag for logging detections
-    new_log = True
 
-    # Infinite loop to show frame as video
-    while True:
+    # Set the current time values
+    c_min = time.localtime(time.time()).tm_min
+    c_hour = time.localtime(time.time()).tm_hour
 
-        # Current frame
-        frame = URLtoNumpy("https://webcam.thesnowcentre.com/record/current.jpg")
+    # Run indefinetely
+    while (True):
 
-        # Gray conversion and noise reduction (smoothening)
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blur_frame = cv2.GaussianBlur(gray_frame, (25, 25), 3)
+        # Process the current frame from the URL
+        disp_frame, curr_frame = ProcessNewFrame("https://webcam.thesnowcentre.com/record/current.jpg")
+        
+        # Detect contours of motion by comparing to the previous frame
+        full_conts = DetectMotion(prev_frame, curr_frame)
 
-        # Store comparison frame if none exists
-        if prev_frame is None:
-            prev_frame = blur_frame
-            continue
+        # Reduce contours to only ones within a certain size range
+        size_conts = [c for c in full_conts if cv2.contourArea(c) > 750 and \
+                                               cv2.contourArea(c) < 3500]
 
-        # Skip if frames are the same
-        if np.array_equiv(prev_frame, blur_frame) or np.array_equal(prev_frame, blur_frame):
-            continue
+        # Detect contours that overlap with specified detection areas
+        coll_conts = ContourDetections(size_conts, dect_conts)
 
-        # The difference between the comparison frame and the previous
-        delta_frame = cv2.subtract(prev_frame, blur_frame)
-
-        # The delta_frame is converted into a binary image using a threshold of 15
-        binary_frame = cv2.threshold(delta_frame, 15, 255, cv2.THRESH_BINARY)[1]
-        # Initialise a list of contours within the current frame
-        (contours,_) = cv2.findContours(binary_frame, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE )
-
-        for cont in contours:
-            # Filter out small/large contours to reduce false positives
-            if cv2.contourArea(cont) < 750 or cv2.contourArea(cont) > 3500:
-                continue
-
-            # Draw contour bounding box
-            (x, y, w, h)=cv2.boundingRect(cont)
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
-
-            # Check for contour collisions 
-            if (cbox.DetectCollision(x+w/2, y+h/2)):
-                # Highlight contour box
-                cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 1)
-                detections += 1
+        # Record detections
+        detections += len(coll_conts)
 
         # Store current frame for next frame comparison
-        prev_frame = blur_frame
+        prev_frame = curr_frame
 
-        # Get current date+time
-        slope_time = time.gmtime(time.time())
-        curr_date = str(slope_time.tm_mday) +"/"+ str(slope_time.tm_mon) +"/"+ str(slope_time.tm_year)
-        curr_time = str(slope_time.tm_hour) +":"+ str(slope_time.tm_min) +":"+ str(slope_time.tm_sec)
+        # Only show display in testing mode
+        if (prod == False):
 
-        cv2.putText(frame, "Date: " + curr_date, 
-                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
-        cv2.putText(frame, "Time: " + curr_time, 
-                    (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+            # Draw right-sized contours
+            cv2.drawContours(disp_frame, size_conts, -1, (0, 255, 0), 1)
+            # Draw all detection contours
+            cv2.drawContours(disp_frame, dect_conts, -1, (255, 0, 0), 1)
+            # Highlight detected contours
+            cv2.drawContours(disp_frame, coll_conts, -1, (0, 0, 255), 2)
 
-        # If at the end of the hour
-        if (slope_time.tm_min == 59 and slope_time.tm_sec == 59):
-            # Log detections only once
-            if (new_log == True):
-                new_log = False
-                detections = 0
-                print("Logging total detections at", curr_time, "on", curr_date)
-        else:
-            # Allow logging if in new hour
-            new_log = True
+            # Total detections
+            cv2.putText(disp_frame, "Detections: " + str(detections), (10, 800), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 2)
+                    
+            # Display frame
+            try:
+                cv2.imshow('live feed', disp_frame)
+            except cv2.error as err:
+                print(err)
 
-        # Total detections
-        cv2.putText(frame, "Detections: " + str(detections), (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
-                
-        # Collision Box
-        cv2.rectangle(frame, (cbox.x, cbox.y), (cbox.x + cbox.w, cbox.y + cbox.h), cbox.colour, 2)
 
-        # Display frame
-        cv2.imshow('live feed', frame)
+        local_time = time.localtime(time.time())
+        local_date = str(local_time.tm_year) + "/" + str(local_time.tm_mon) + "/" + str(local_time.tm_mday)
+        
+        # If in production mode and at the end of the hour
+        if (prod == True and local_time.tm_hour != c_hour):
+            LogDetections("prod_conf.cnf", local_date,
+                          str(local_time.tm_hour-1) + ":" + str(local_time.tm_min) + ":" + str(local_time.tm_sec),
+                          detections)
+
+            c_hour = local_time.tm_hour
+            detections = 0
+
+        # If in testing mode and at the end of the minute
+        elif (prod == False and local_time.tm_min != c_min):
+            LogDetections("test_conf.cnf", local_date,
+                          str(local_time.tm_hour) + ":" + str(local_time.tm_min-1) + ":" + str(local_time.tm_sec),
+                          detections)
+
+            c_min = local_time.tm_min
+            detections = 0
 
         # Press 'q' to quit
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
 
+def LogDetections(conf_path, date, time, dets):
+
+    # Read configuration data
+    try:
+        with open(conf_path) as f:
+            conf = json.loads(f.read())
+    except:
+        print("Invalid configuration file/path")
+
+    # Connect to MySQL db
+    try:
+        with (mysql.connector.connect(**conf) as cnx):
+            with cnx.cursor() as cur:
+                # Retrieve the table this account has access to
+                query_tables = "SHOW TABLES"
+                cur.execute(query_tables)
+                access_table = cur.fetchone()[0]
+
+                # Insert Date, Time and Detections as a single row
+                insert_logg = ("INSERT INTO {t}"
+                            "(Date, Time, Detections)"
+                            "VALUES (%s, %s, %s)")
+
+                cur.execute(insert_logg.format(t=access_table), (date, time, dets))
+
+                # Ensure data is committed to the db
+                cnx.commit()
+
+    except mysql.connector.Error as err:
+        return err
 
 
-# Main
-CalculateSlopeDensity()
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser(description="Run a rider detection and logging process for the Hemel Hempstead snow centre that runs indefinetely")
+
+    parser.add_argument("--production", nargs="?", const=False, default=False, 
+                        type=bool, help="Run in production (True) or testing (False) mode")
+
+    args = parser.parse_args()
+
+    main(prod=args.production)

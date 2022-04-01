@@ -1,3 +1,7 @@
 /slope_density
 
 /__pycache__
+
+test_conf.cnf
+
+prod_conf.cnf
